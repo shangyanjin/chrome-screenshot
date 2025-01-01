@@ -4,9 +4,12 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,20 +18,81 @@ import (
 )
 
 const (
-	// Default input directory
-	defaultInputDir = "d:/ui"
-	// Number of worker threads
-	numWorkers = 3
+	// Default number of concurrent workers
+	defaultThreads = 3
+	// JPEG quality for screenshots (1-100)
+	defaultQuality = 85
+	// Default viewport width in pixels
+	defaultViewWidth = 1920
+	// Default viewport height in pixels
+	defaultViewHeight = 1080
+	// Wait time for page resources to load
+	pageWaitTime = 3 * time.Second
 )
 
-// Screenshot task structure
+// Screenshot task structure represents a single screenshot job
 type screenshotTask struct {
-	path       string
-	relPath    string
+	// Full path to the HTML file
+	path string
+	// Relative path from input directory
+	relPath string
+	// Full path where the screenshot will be saved
 	outputPath string
 }
 
-// Worker function to process screenshots
+func main() {
+	// Define flags
+	dirFlag := flag.String("d", "", "input directory")
+	numFlag := flag.Int("n", 3, "number of workers")
+	flag.Usage = printUsage
+	flag.Parse()
+
+	var inputDir string
+	var numWorkers int = 3
+
+	// Check if using flags
+	if *dirFlag != "" {
+		inputDir = *dirFlag
+		numWorkers = *numFlag
+	} else {
+		// Check position arguments
+		args := flag.Args()
+		if len(args) < 1 {
+			printUsage()
+		}
+		inputDir = args[0]
+
+		// Parse thread number if provided
+		if len(args) > 1 {
+			threads, err := strconv.Atoi(args[1])
+			if err != nil {
+				log.Fatalf("Invalid thread number: %s", args[1])
+			}
+			if threads < 1 {
+				log.Fatalf("Thread number must be greater than 0")
+			}
+			numWorkers = threads
+		}
+	}
+
+	// Validate input directory
+	if _, err := os.Stat(inputDir); os.IsNotExist(err) {
+		log.Fatalf("Input directory %s does not exist", inputDir)
+	}
+
+	// Create main context
+	ctx, cancel := chromedp.NewContext(context.Background())
+	defer cancel()
+
+	// Process directory and its subdirectories
+	if err := dirScreenshot(ctx, inputDir, numWorkers); err != nil {
+		log.Fatal(err)
+	}
+
+	log.Printf("Screenshot process completed using %d workers", numWorkers)
+}
+
+// Worker function to process screenshots in parallel
 func screenshotWorker(ctx context.Context, taskCh <-chan screenshotTask, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -52,8 +116,9 @@ func screenshotWorker(ctx context.Context, taskCh <-chan screenshotTask, wg *syn
 	}
 }
 
-// dirScreenshot processes all HTML files in the default directory and its subdirectories
-func dirScreenshot(ctx context.Context) error {
+// dirScreenshot processes all HTML files in the input directory and its subdirectories
+// using the specified number of concurrent workers
+func dirScreenshot(ctx context.Context, inputDir string, numWorkers int) error {
 	// Create task channel and wait group
 	taskCh := make(chan screenshotTask)
 	var wg sync.WaitGroup
@@ -68,7 +133,7 @@ func dirScreenshot(ctx context.Context) error {
 	// Walk through directory and send tasks
 	go func() {
 		defer close(taskCh)
-		filepath.Walk(defaultInputDir, func(path string, info os.FileInfo, err error) error {
+		filepath.Walk(inputDir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
@@ -79,7 +144,7 @@ func dirScreenshot(ctx context.Context) error {
 			}
 
 			// Get relative path for output
-			relPath, err := filepath.Rel(defaultInputDir, path)
+			relPath, err := filepath.Rel(inputDir, path)
 			if err != nil {
 				return err
 			}
@@ -102,22 +167,13 @@ func dirScreenshot(ctx context.Context) error {
 	return nil
 }
 
-func main() {
-	// Check if default input directory exists
-	if _, err := os.Stat(defaultInputDir); os.IsNotExist(err) {
-		log.Fatalf("Input directory %s does not exist", defaultInputDir)
-	}
-
-	// Create main context
-	ctx, cancel := chromedp.NewContext(context.Background())
-	defer cancel()
-
-	// Process default directory and its subdirectories
-	if err := dirScreenshot(ctx); err != nil {
-		log.Fatal(err)
-	}
-
-	log.Printf("Screenshot process completed")
+// Print usage information when invalid arguments are provided
+func printUsage() {
+	fmt.Printf("Usage: %s <input_directory> [thread_number]\n", os.Args[0])
+	fmt.Printf("   or: %s -d <input_directory> -n <thread_number>\n\n", os.Args[0])
+	fmt.Printf("Example:\n")
+	fmt.Printf("  %s ./html_files 5\n", os.Args[0])
+	os.Exit(1)
 }
 
 // elementScreenshot takes a screenshot of a specific element.
@@ -128,20 +184,21 @@ func elementScreenshot(urlstr, sel string, res *[]byte) chromedp.Tasks {
 	}
 }
 
-// fullScreenshot takes a screenshot of the entire browser viewport.
-//
-// Note: chromedp.FullScreenshot overrides the device's emulation settings. Use
-// device.Reset to reset the emulation and viewport settings.
+// fullScreenshot takes a screenshot of the entire browser viewport
+// urlstr: URL of the page to screenshot
+// quality: JPEG quality (1-100)
+// res: pointer to byte slice where the screenshot will be stored
 func fullScreenshot(urlstr string, quality int, res *[]byte) chromedp.Tasks {
 	return chromedp.Tasks{
-		// Set viewport to Full HD resolution (1920x1080)
-		chromedp.EmulateViewport(1920, 1080),
+		// Set viewport to Full HD resolution
+		chromedp.EmulateViewport(defaultViewWidth, defaultViewHeight),
+		// Navigate to the target URL
 		chromedp.Navigate(urlstr),
-		// Wait for the page to be loaded
+		// Wait for the page body to be ready
 		chromedp.WaitReady("body", chromedp.ByQuery),
-		// Wait 3 seconds to ensure all resources are loaded
-		chromedp.Sleep(3 * time.Second),
-		// Take full screenshot with 85% quality
-		chromedp.FullScreenshot(res, 85),
+		// Additional wait time for dynamic content and resources
+		chromedp.Sleep(pageWaitTime),
+		// Take full screenshot with specified quality
+		chromedp.FullScreenshot(res, defaultQuality),
 	}
 }
