@@ -119,40 +119,93 @@ func screenshotWorker(ctx context.Context, taskCh <-chan screenshotTask, wg *syn
 // dirScreenshot processes all HTML files in the input directory and its subdirectories
 // using the specified number of concurrent workers
 func dirScreenshot(ctx context.Context, inputDir string, numWorkers int) error {
+	// Count total HTML files first
+	var totalFiles int
+	filepath.Walk(inputDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".html") {
+			totalFiles++
+		}
+		return nil
+	})
+
+	log.Printf("Found %d HTML files in %s", totalFiles, inputDir)
+
 	// Create task channel and wait group
 	taskCh := make(chan screenshotTask)
 	var wg sync.WaitGroup
+	processedFiles := 0
+	var processedMutex sync.Mutex
 
 	// Start worker goroutines
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		workerCtx, _ := chromedp.NewContext(ctx)
-		go screenshotWorker(workerCtx, taskCh, &wg)
+		go func(id int) {
+			defer wg.Done()
+			for task := range taskCh {
+				log.Printf("[Worker %d] Processing: %s", id, task.relPath)
+
+				var buf []byte
+				fileURL := "file:///" + strings.ReplaceAll(task.path, "\\", "/")
+
+				if err := chromedp.Run(workerCtx, fullScreenshot(fileURL, 90, &buf)); err != nil {
+					log.Printf("[Worker %d] Error processing %s: %v", id, task.path, err)
+					continue
+				}
+
+				if err := os.WriteFile(task.outputPath, buf, 0644); err != nil {
+					log.Printf("[Worker %d] Error saving %s: %v", id, task.path, err)
+					continue
+				}
+
+				processedMutex.Lock()
+				processedFiles++
+				progress := float64(processedFiles) / float64(totalFiles) * 100
+				log.Printf("[Progress: %.1f%%] Completed %s (%d/%d)",
+					progress, task.relPath, processedFiles, totalFiles)
+				processedMutex.Unlock()
+			}
+		}(i + 1)
 	}
 
 	// Walk through directory and send tasks
 	go func() {
 		defer close(taskCh)
+		currentDir := ""
+		dirFileCount := 0
+
 		filepath.Walk(inputDir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
 
-			// Skip if not HTML file
-			if info.IsDir() || !strings.HasSuffix(strings.ToLower(info.Name()), ".html") {
+			// Print directory info
+			if info.IsDir() {
+				if currentDir != "" {
+					log.Printf("Directory completed: %s (%d files)", currentDir, dirFileCount)
+				}
+				currentDir = path
+				dirFileCount = 0
+				log.Printf("Entering directory: %s", path)
 				return nil
 			}
 
-			// Get relative path for output
+			// Skip if not HTML file
+			if !strings.HasSuffix(strings.ToLower(info.Name()), ".html") {
+				return nil
+			}
+
+			dirFileCount++
 			relPath, err := filepath.Rel(inputDir, path)
 			if err != nil {
 				return err
 			}
 
-			// Create output path in the same directory with .jpg extension
 			outputPath := strings.TrimSuffix(path, ".html") + ".jpg"
 
-			// Send task to worker
 			taskCh <- screenshotTask{
 				path:       path,
 				relPath:    relPath,
@@ -160,10 +213,16 @@ func dirScreenshot(ctx context.Context, inputDir string, numWorkers int) error {
 			}
 			return nil
 		})
+
+		// Print last directory info
+		if currentDir != "" {
+			log.Printf("Directory completed: %s (%d files)", currentDir, dirFileCount)
+		}
 	}()
 
 	// Wait for all workers to complete
 	wg.Wait()
+	log.Printf("All files processed. Total: %d files", totalFiles)
 	return nil
 }
 
